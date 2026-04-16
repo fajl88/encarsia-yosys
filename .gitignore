@@ -48,3 +48,5 @@ __pycache__
 /tests/ystests
 /hosts
 /.vscode
+
+/ignore

@@ -2309,6 +2309,10 @@ struct VerilogBackend : public Backend {
 		log("        without this option all internal cells are converted to Verilog\n");
 		log("        expressions.\n");
 		log("\n");
+		log("    -nocleanup\n");
+		log("        skip bmuxmap, demuxmap, and clean_zerowidth before dumping. use when\n");
+		log("        exporting a snapshot that must not be rewritten (e.g. debug dumps).\n");
+		log("\n");
 		log("    -noparallelcase\n");
 		log("        With this option no parallel_case attributes are used. Instead, a case\n");
 		log("        statement that assigns don't-care values for priority dependent inputs\n");
@@ -2394,6 +2398,7 @@ struct VerilogBackend : public Backend {
 
 		bool blackboxes = false;
 		bool selected = false;
+		bool nocleanup = false;
 
 		auto_name_map.clear();
 		reg_wires.clear();
@@ -2423,6 +2428,10 @@ struct VerilogBackend : public Backend {
 			}
 			if (arg == "-noexpr") {
 				noexpr = true;
+				continue;
+			}
+			if (arg == "-nocleanup") {
+				nocleanup = true;
 				continue;
 			}
 			if (arg == "-noparallelcase") {
@@ -2485,11 +2494,13 @@ struct VerilogBackend : public Backend {
 		}
 
 		log_push();
-		if (!noexpr) {
-			Pass::call(design, "bmuxmap");
-			Pass::call(design, "demuxmap");
+		if (!nocleanup) {
+			if (!noexpr) {
+				Pass::call(design, "bmuxmap");
+				Pass::call(design, "demuxmap");
+			}
+			Pass::call(design, "clean_zerowidth");
 		}
-		Pass::call(design, "clean_zerowidth");
 		log_pop();
 
 		design->sort();

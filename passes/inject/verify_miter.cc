@@ -28,8 +28,10 @@
 #include <stdio.h>
 #include <algorithm>
 #include <errno.h>
+#include <fstream>
 #include <string.h>
 #include "selection.h"
+#include "inject_utils.h"
 #include <chrono>
 
 USING_YOSYS_NAMESPACE
@@ -53,12 +55,20 @@ struct VerifyMiterPass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
+		auto run_start = std::chrono::steady_clock::now();
 		std::vector<std::pair<std::string, std::string>> sets, sets_init;
 		std::map<int, std::vector<std::pair<std::string, std::string>>> sets_at;
 		std::map<int, std::vector<std::string>> unsets_at;
 		std::vector<std::string> shows;
 		int max_sensitization = 20, max_propagation = 32, initsteps = 0, timeout = 0, stepsize = 1;
 		bool set_init_zero = false, show_inputs = false, show_outputs = false;
+		bool sensitized = false, propagated = false;
+		bool timeout_in_sensitization = false, timeout_in_propagation = false;
+		std::string failure_phase = "none";
+		int sensitization_step_found = -1, propagation_step_found = -1;
+		int sensitization_attempts = 0, propagation_attempts = 0;
+		long long sensitization_time_ms = 0, propagation_time_ms = 0;
+		long long preprocess_time_ms = 0;
 
 		log_header(design, "Executing VerifyMiterPass pass.\n");
 
@@ -130,6 +140,7 @@ struct VerifyMiterPass : public Pass {
 		Pass::call(design, "opt -full");
 		Pass::call(design, "clk2fflogic");
 		Pass::call(design, "opt -full -fine");
+		preprocess_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - run_start).count();
 
 
     RTLIL::Module *miter_module = design->module("\\miter");
@@ -175,7 +186,10 @@ struct VerifyMiterPass : public Pass {
 		log("Sensitizing the bug!\n");
 		log("time: %s\n", get_time().c_str());
 		log_flush();
+		auto sensitization_start = std::chrono::steady_clock::now();
+		bool done_with_sensitization = false;
         for(int sensitization_step = 1; sensitization_step <= max_sensitization; sensitization_step++){
+			++sensitization_attempts;
             sathelper.setup(sensitization_step, sensitization_step == 1);
             sathelper.generate_model();
             log_flush();
@@ -183,6 +197,9 @@ struct VerifyMiterPass : public Pass {
             // TODO maybe implement steps of size > 1
 
             if (sathelper.solve(sathelper.ez->NOT(sathelper.satgen.signals_eq(host_output, reference_output, sensitization_step)))){
+				sensitized = true;
+				sensitization_step_found = sensitization_step;
+				sensitization_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - sensitization_start).count();
 
                 log("Sensitized the bug.\n");
 				log("time: %s\n", get_time().c_str());
@@ -196,7 +213,9 @@ struct VerifyMiterPass : public Pass {
                     sathelper.ez->assume(sathelper.modelValues.at(i) ? sathelper.modelExpressions.at(i) : sathelper.ez->NOT(sathelper.modelExpressions.at(i)));
 
 
+				auto propagation_start = std::chrono::steady_clock::now();
                 for(int propagation_step = sensitization_step + 1; propagation_step <= max_propagation; ++propagation_step){
+					++propagation_attempts;
                     sathelper.setup(propagation_step, propagation_step == 1);
                     sathelper.generate_model();
                     log_flush();
@@ -207,33 +226,78 @@ struct VerifyMiterPass : public Pass {
 					// sathelper.
 					// sathelper.ez->printDIMACS()
                     if(sathelper.solve(sathelper.ez->NOT(sathelper.satgen.signals_eq(host_observables, reference_observables, propagation_step)))){
+						propagated = true;
+						propagation_step_found = propagation_step;
                         log("Propagated the bug.\n");
 						log("time: %s\n", get_time().c_str());
 						log_flush();
                         sathelper.print_model();
                         log_flush();
+						propagation_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - propagation_start).count();
                         break;
                     } else if (sathelper.gotTimeout) {
+						timeout_in_propagation = true;
                         log("Timed out.\n");
 						log("time: %s\n", get_time().c_str());
                         log_flush();
+						propagation_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - propagation_start).count();
                         break;
                     }
                 }
-
-                // Exit outer sat loop
-                sensitization_step += max_sensitization;
+				if (!propagated && !timeout_in_propagation) {
+					propagation_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - propagation_start).count();
+				}
+				done_with_sensitization = true;
             } else if (sathelper.gotTimeout) {
+				timeout_in_sensitization = true;
                 log("Timed out.\n");
 				log("time: %s\n", get_time().c_str());
                 log_flush();
+				sensitization_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - sensitization_start).count();
                 break;
             } else if (sensitization_step == max_sensitization) {
                 log("Failed to sensitize the bug.\n");
 				log("time: %s\n", get_time().c_str());
 				log_flush();
+				sensitization_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - sensitization_start).count();
             }
+			if (done_with_sensitization)
+				break;
         }
+
+		if (timeout_in_sensitization) failure_phase = "sensitization_timeout";
+		else if (!sensitized) failure_phase = "sensitization_unsat";
+		else if (timeout_in_propagation) failure_phase = "propagation_timeout";
+		else if (!propagated) failure_phase = "propagation_unsat";
+
+		long long total_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - run_start).count();
+
+		std::ofstream summary_file("verification_summary.json");
+		if (summary_file.is_open()) {
+			summary_file << "{\n";
+			summary_file << "  \"pass\": \"verify_miter\",\n";
+			summary_file << "  \"timestamp\": \"" << json_escape(get_time()) << "\",\n";
+			summary_file << "  \"result\": {\n";
+			summary_file << "    \"sensitized\": " << (sensitized ? "true" : "false") << ",\n";
+			summary_file << "    \"propagated\": " << (propagated ? "true" : "false") << ",\n";
+			summary_file << "    \"failure_phase\": \"" << failure_phase << "\",\n";
+			summary_file << "    \"timeout_in_sensitization\": " << (timeout_in_sensitization ? "true" : "false") << ",\n";
+			summary_file << "    \"timeout_in_propagation\": " << (timeout_in_propagation ? "true" : "false") << ",\n";
+			summary_file << "    \"sensitization_step_found\": " << sensitization_step_found << ",\n";
+			summary_file << "    \"propagation_step_found\": " << propagation_step_found << "\n";
+			summary_file << "  },\n";
+			summary_file << "  \"timing_ms\": {\n";
+			summary_file << "    \"preprocess\": " << preprocess_time_ms << ",\n";
+			summary_file << "    \"sensitization\": " << sensitization_time_ms << ",\n";
+			summary_file << "    \"propagation\": " << propagation_time_ms << ",\n";
+			summary_file << "    \"total\": " << total_time_ms << "\n";
+			summary_file << "  },\n";
+			summary_file << "  \"attempts\": {\n";
+			summary_file << "    \"sensitization\": " << sensitization_attempts << ",\n";
+			summary_file << "    \"propagation\": " << propagation_attempts << "\n";
+			summary_file << "  }\n";
+			summary_file << "}\n";
+		}
 	}
 } VerifyMiterPass;
 

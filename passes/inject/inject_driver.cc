@@ -29,9 +29,11 @@
 #include <stdio.h>
 #include <algorithm>
 #include <errno.h>
+#include <fstream>
 #include <string.h>
 #include <sys/stat.h>
 #include "selection.h"
+#include "inject_utils.h"
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -47,6 +49,45 @@ static void write_design(RTLIL::Design *design, std::string output_directory, in
 static void write_reference(RTLIL::Design *design, std::string output_directory, int index){
 	std::string host_directory = output_directory + "/" + std::to_string(index);
 	Pass::call(design, "write_rtlil " + host_directory + "/reference_driver.rtlil");
+}
+
+static bool module_assign_widths_ok(RTLIL::Module *module)
+{
+	for (auto &conn : module->connections())
+		if (conn.first.size() != conn.second.size())
+			return false;
+	return true;
+}
+
+static RTLIL::SigSpec resize_like_verilog_assign(RTLIL::SigSpec rhs, int lhs_width)
+{
+	if (rhs.size() > lhs_width)
+		return rhs.extract(0, lhs_width);
+	if (rhs.size() < lhs_width) {
+		rhs.append(RTLIL::Const(RTLIL::State::S0, lhs_width - rhs.size()));
+	}
+	return rhs;
+}
+
+static void write_bug_summary(std::string output_directory, int index, RTLIL::IdString module_name,
+		RTLIL::SigSpec target, RTLIL::SigSpec original_driver, RTLIL::SigSpec injected_driver_raw, RTLIL::SigSpec injected_driver_effective)
+{
+	std::string host_directory = output_directory + "/" + std::to_string(index);
+	std::ofstream summary_file(host_directory + "/bug_summary.json");
+	if (!summary_file.is_open())
+		log_error("Error creating bug summary file.\n");
+
+	summary_file << "{\n";
+	summary_file << "  \"type\": \"driver_mixup\",\n";
+	summary_file << "  \"module\": \"" << json_escape(module_name.str()) << "\",\n";
+	summary_file << "  \"target_wire\": \"" << json_escape(log_signal(target)) << "\",\n";
+	summary_file << "  \"original_driver\": \"" << json_escape(log_signal(original_driver)) << "\",\n";
+	summary_file << "  \"injected_driver_raw\": \"" << json_escape(log_signal(injected_driver_raw)) << "\",\n";
+	summary_file << "  \"injected_driver_effective\": \"" << json_escape(log_signal(injected_driver_effective)) << "\",\n";
+	summary_file << "  \"target_width\": " << target.size() << ",\n";
+	summary_file << "  \"injected_driver_raw_width\": " << injected_driver_raw.size() << ",\n";
+	summary_file << "  \"injected_driver_effective_width\": " << injected_driver_effective.size() << "\n";
+	summary_file << "}\n";
 }
 
 static void expose_cells(RTLIL::Module *module){
@@ -191,16 +232,6 @@ struct InjectDriverPass : public Pass {
 
 				if (!driver.extract(target).empty()) continue;
 
-				if (driver.size() < target.size()) {
-					if (driver.is_fully_const()) {
-						driver.append(RTLIL::Const(driver.as_const().bits.back(), target.size()-driver.size()));
-					} else {
-						target = target.extract(0, driver.size());
-					}
-				} else if (driver.size() > target.size()) {
-					driver = driver.extract(0, target.size());
-				}
-
 				if (!target.is_wire()) continue;
 				
 				for (auto &connection : module->connections_) {
@@ -210,15 +241,37 @@ struct InjectDriverPass : public Pass {
 					// log("extract: %s\n", log_signal(connection.first.extract(target)));
 					// log("connection.first: %s\n", log_signal(connection.first));
 					// log("connection.second: %s\n", log_signal(connection.second));
-					++index;
 
 					RTLIL::SigSpec original_driver = connection.second;
+					RTLIL::SigSpec effective_driver = resize_like_verilog_assign(driver, target.size());
 					// log("before: %s %s\n", log_signal(connection.first), log_signal(connection.second));
-					connection.first.replace(target, driver, &connection.second);
-					if (connection.second == original_driver) break;
+					connection.first.replace(target, effective_driver, &connection.second);
+					if (connection.second == original_driver)
+						continue;
+					if (GetSize(connection.first) != GetSize(connection.second)) {
+						connection.second = original_driver;
+						continue;
+					}
+
+					++index;
 					target.as_wire()->attributes[ID(buggy)] = RTLIL::Const("buggy");
 					// log("after: %s %s\n", log_signal(connection.first), log_signal(connection.second));
 					write_design(design, output_directory, index);
+					write_bug_summary(output_directory, index, module->name, target, original_driver, driver, effective_driver);
+					Pass::call(design, "select -clear");
+					Pass::call(design, "select " + module->name.str());
+					{
+						std::string ctx_base = output_directory + "/" + std::to_string(index) + "/bug_context";
+						if (module_assign_widths_ok(module))
+							Pass::call(design, "write_verilog -selected -noattr -nocleanup " + ctx_base + ".v");
+						else {
+							std::string ctx_rtlil = ctx_base + ".rtlil";
+							log_warning("inject_driver: inconsistent assign widths in %s; writing %s instead of .v\n",
+									log_id(module->name), ctx_rtlil.c_str());
+							Pass::call(design, "write_rtlil -selected " + ctx_rtlil);
+						}
+					}
+					Pass::call(design, "select -clear");
 					target.as_wire()->attributes.erase(ID(buggy));
 					connection.second = original_driver;
 					write_reference(design, output_directory, index);
