@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <algorithm>
+#include <numeric>
 #include <errno.h>
 #include <fstream>
 #include <string.h>
@@ -134,6 +135,31 @@ static void expose_cells(RTLIL::Module *module){
 	}
 }
 
+static std::vector<int> compute_module_budgets(int module_count, int num_bugs)
+{
+	std::vector<int> budgets(module_count, 0);
+	if (module_count <= 0 || num_bugs <= 0)
+		return budgets;
+
+	std::vector<int> order(module_count);
+	std::iota(order.begin(), order.end(), 0);
+	std::random_shuffle(order.begin(), order.end());
+
+	if (module_count > num_bugs) {
+		for (int i = 0; i < num_bugs; ++i)
+			budgets[order[i]] = 1;
+		return budgets;
+	}
+
+	int base = num_bugs / module_count;
+	int rem = num_bugs % module_count;
+	for (int i = 0; i < module_count; ++i)
+		budgets[i] = base;
+	for (int i = 0; i < rem; ++i)
+		budgets[order[i]]++;
+	return budgets;
+}
+
 struct InjectDriverPass : public Pass {
 	InjectDriverPass() : Pass("inject_driver", "produce designs with signal mix-ups.") { }
 	void help() override
@@ -150,12 +176,15 @@ struct InjectDriverPass : public Pass {
 		log("        generated designs are stored in the directory\n");
 		log("    -num-bugs number\n");
 		log("        the desired number of bugs to be injected into the design\n");
+		log("    -seed number\n");
+		log("        seed for deterministic random bug selection\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
 		std::string output_directory;
 		int num_bugs = 1000;
-		int bugs_per_module;
+		bool seed_set = false;
+		unsigned seed = 0;
 		int index = 0;
 
 		log_header(design, "Inject Driver.\n");
@@ -170,13 +199,28 @@ struct InjectDriverPass : public Pass {
 				num_bugs = atoi(args[++argidx].c_str());
 				continue;
 			}
+			if (args[argidx] == "-seed" && argidx+1 < args.size()) {
+				seed = (unsigned)strtoul(args[++argidx].c_str(), nullptr, 10);
+				seed_set = true;
+				continue;
+			}
 		}
 		if (output_directory.empty()) {
 			log_error("Missing mandatory argument -output-dir!\n");
 		}
+		if (seed_set)
+			srand(seed);
+		if (num_bugs < 0) {
+			log_error("Argument -num-bugs must be non-negative.\n");
+		}
+		if (num_bugs == 0) {
+			log("inject_driver: requested 0 bugs, nothing to do.\n");
+			return;
+		}
 
-		bugs_per_module = num_bugs / design->selected_modules().size();
-		if (!bugs_per_module) bugs_per_module = 1;
+		std::vector<RTLIL::Module*> eligible_modules;
+		std::vector<std::vector<RTLIL::SigSpec>> module_drivers;
+		std::vector<std::vector<RTLIL::SigSpec>> module_targets;
 
 		for (auto module : design->selected_modules()) {
 			std::set<RTLIL::SigSpec> drivers_set, targets_set;
@@ -225,8 +269,32 @@ struct InjectDriverPass : public Pass {
 			}
 
 			std::vector<RTLIL::SigSpec> drivers(drivers_set.begin(), drivers_set.end()), targets(targets_set.begin(), targets_set.end());
-			int start_index = index;
-			while (index-start_index < bugs_per_module) {
+			if (!drivers.empty() && !targets.empty()) {
+				eligible_modules.push_back(module);
+				module_drivers.push_back(drivers);
+				module_targets.push_back(targets);
+			}
+		}
+
+		if (eligible_modules.empty()) {
+			log_warning("inject_driver: no eligible modules found; generated 0 bugs.\n");
+			return;
+		}
+
+		std::vector<int> budgets = compute_module_budgets(GetSize(eligible_modules), num_bugs);
+		int generated = 0;
+
+		for (int module_idx = 0; module_idx < GetSize(eligible_modules); ++module_idx) {
+			RTLIL::Module *module = eligible_modules[module_idx];
+			std::vector<RTLIL::SigSpec> &drivers = module_drivers[module_idx];
+			std::vector<RTLIL::SigSpec> &targets = module_targets[module_idx];
+			int module_budget = budgets[module_idx];
+			int module_generated = 0;
+			int attempts = 0;
+			int max_attempts = std::max(1000, module_budget * 200);
+
+			while (module_generated < module_budget && attempts < max_attempts) {
+				++attempts;
 				RTLIL::SigSpec driver = drivers.at(rand() % (int)drivers.size());
 				RTLIL::SigSpec target = targets.at(rand() % (int)targets.size());
 
@@ -254,6 +322,8 @@ struct InjectDriverPass : public Pass {
 					}
 
 					++index;
+					++generated;
+					++module_generated;
 					target.as_wire()->attributes[ID(buggy)] = RTLIL::Const("buggy");
 					// log("after: %s %s\n", log_signal(connection.first), log_signal(connection.second));
 					write_design(design, output_directory, index);
@@ -279,6 +349,11 @@ struct InjectDriverPass : public Pass {
 					break;
 				}
 			}
+		}
+
+		if (generated < num_bugs) {
+			log_warning("inject_driver: requested %d bugs, generated %d. Capped to available candidates.\n",
+					num_bugs, generated);
 		}
 	}
 } InjectDriverPass;

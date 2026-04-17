@@ -28,6 +28,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <algorithm>
+#include <numeric>
+#include <unordered_map>
 #include <errno.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -43,6 +45,36 @@ static void write_design(RTLIL::Design *design, std::string output_directory, in
 	}
 	// TODO remove this call maybe
 	Pass::call(design, "write_rtlil " + host_directory + "/host_amt.rtlil");
+}
+
+struct AmtBugCandidate {
+	RTLIL::Cell *cell;
+	std::vector<selection_t> selections;
+};
+
+static std::vector<int> compute_module_budgets(int module_count, int num_bugs)
+{
+	std::vector<int> budgets(module_count, 0);
+	if (module_count <= 0 || num_bugs <= 0)
+		return budgets;
+
+	std::vector<int> order(module_count);
+	std::iota(order.begin(), order.end(), 0);
+	std::random_shuffle(order.begin(), order.end());
+
+	if (module_count > num_bugs) {
+		for (int i = 0; i < num_bugs; ++i)
+			budgets[order[i]] = 1;
+		return budgets;
+	}
+
+	int base = num_bugs / module_count;
+	int rem = num_bugs % module_count;
+	for (int i = 0; i < module_count; ++i)
+		budgets[i] = base;
+	for (int i = 0; i < rem; ++i)
+		budgets[order[i]]++;
+	return budgets;
 }
 
 struct InjectAmtPass : public Pass {
@@ -61,12 +93,15 @@ struct InjectAmtPass : public Pass {
 		log("        generated designs are stored in the directory\n");
 		log("    -num-bugs number\n");
 		log("        the desired number of bugs to be injected into the design\n");
+		log("    -seed number\n");
+		log("        seed for deterministic random bug selection\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
 		std::string output_directory;
-		int num_bugs = 1000;
-		int bugs_per_module;
+		int num_bugs = 100;
+		bool seed_set = false;
+		unsigned seed = 0;
 		int index = 0;
 
 		log_header(design, "Executing InjectAmt pass (producing designs with buggy AMTs).\n");
@@ -81,84 +116,120 @@ struct InjectAmtPass : public Pass {
 				num_bugs = atoi(args[++argidx].c_str());
 				continue;
 			}
+			if (args[argidx] == "-seed" && argidx+1 < args.size()) {
+				seed = (unsigned)strtoul(args[++argidx].c_str(), nullptr, 10);
+				seed_set = true;
+				continue;
+			}
 		}
 		if (output_directory.empty()) {
 			log_error("Missing mandatory argument -output-dir!\n");
 		}
+		if (seed_set)
+			srand(seed);
+		if (num_bugs < 0) {
+			log_error("Argument -num-bugs must be non-negative.\n");
+		}
+		if (num_bugs == 0) {
+			log("inject_amt: requested 0 bugs, nothing to do.\n");
+			return;
+		}
 
-		bugs_per_module = num_bugs / design->selected_modules().size();
-		if (!bugs_per_module) bugs_per_module = 1;
-
-		// TODO create hosts directory
+		std::vector<RTLIL::Module*> eligible_modules;
+		std::vector<std::vector<AmtBugCandidate>> module_candidates;
+		std::unordered_map<RTLIL::Cell*, std::vector<selection_t>> original_selections;
 
 		for (auto module : design->selected_modules()) {
-			int num_amt_cells = 0;
+			std::vector<AmtBugCandidate> candidates;
 			for (auto cell : module->selected_cells()) {
-				if (cell->type == ID($amt)) {
-					std::vector<selection_t> selections;
-					copy_from_cell(cell, selections);
-					if (selections.size() < 4) continue;
-					++num_amt_cells;
-				}
-			}
-			if (!num_amt_cells) continue;
-			int bugs_per_cell = bugs_per_module / num_amt_cells;
-			if (!bugs_per_cell) bugs_per_cell = 1;
+				if (cell->type != ID($amt))
+					continue;
 
-			for (auto cell : module->selected_cells()) {
-				if (cell->type == ID($amt)) {
-					std::vector<selection_t> selections;
-					copy_from_cell(cell, selections);
-					if (selections.size() < 4) continue;
-					log_amt(cell, selections);
+				std::vector<selection_t> selections;
+				copy_from_cell(cell, selections);
+				if (selections.size() < 4)
+					continue;
+				original_selections[cell] = selections;
+				log_amt(cell, selections);
 
-					std::vector<std::vector<selection_t>> bugs;
-					int selection_index = -1;
-					for (auto &selection : selections) {
-						++selection_index;
-						if (selection.output.is_fully_undef()) continue;
-						for (auto &bit : selection.select.bits) {
-							int one_in = selections.size() * selection.select.size() / bugs_per_cell;
-							if (!one_in) one_in = 1;
-							// if ((rand() % 0xffffffffffff) == 0) {
-							if ((rand() % one_in) == 0) {
-								if (bit == RTLIL::State::S0 || bit == RTLIL::State::S1) {
-									RTLIL::State temp = bit;
-									bit = RTLIL::State::Sa;
-									selection.buggy = true;
-									bugs.push_back(selections);
-									bugs.back().erase(bugs.back().begin() + selection_index);
-									bugs.back().insert(bugs.back().begin(), selection);
-									selection.buggy = false;
-									bit = temp;
-								} else if (bit == RTLIL::State::Sa) {
-									bit = (rand() & 1) ? RTLIL::State::S1 : RTLIL::State::S0;
-									selection.buggy = true;
-									bugs.push_back(selections);
-									selection.buggy = false;
-									bit = RTLIL::State::Sa;
-								}
-							}
+				for (int selection_index = 0; selection_index < GetSize(selections); ++selection_index) {
+					const selection_t &selection = selections[selection_index];
+					if (selection.output.is_fully_undef())
+						continue;
+
+					for (int bit_index = 0; bit_index < GetSize(selection.select.bits); ++bit_index) {
+						RTLIL::State bit = selection.select.bits[bit_index];
+
+						if (bit == RTLIL::State::S0 || bit == RTLIL::State::S1) {
+							std::vector<selection_t> buggy_selections = selections;
+							buggy_selections[selection_index].select.bits[bit_index] = RTLIL::State::Sa;
+							buggy_selections[selection_index].buggy = true;
+							candidates.push_back({cell, buggy_selections});
+						} else if (bit == RTLIL::State::Sa) {
+							std::vector<selection_t> buggy_zero = selections;
+							buggy_zero[selection_index].select.bits[bit_index] = RTLIL::State::S0;
+							buggy_zero[selection_index].buggy = true;
+							candidates.push_back({cell, buggy_zero});
+
+							std::vector<selection_t> buggy_one = selections;
+							buggy_one[selection_index].select.bits[bit_index] = RTLIL::State::S1;
+							buggy_one[selection_index].buggy = true;
+							candidates.push_back({cell, buggy_one});
 						}
 					}
 
-					for (int i = 0; i < 1; ++i) {
-						std::vector<selection_t> buggy_selections = selections;
-						buggy_selections.erase(buggy_selections.begin()+(rand()%(selections.size() + 1)));
-						bugs.push_back(buggy_selections);
+					if (GetSize(selections) > 1) {
+						std::vector<selection_t> removed_selection = selections;
+						removed_selection.erase(removed_selection.begin() + selection_index);
+						candidates.push_back({cell, removed_selection});
 					}
-
-					cell->attributes[ID(buggy)] = RTLIL::Const("buggy");
-					cell->getPort(ID::Y).as_wire()->attributes[ID(buggy)] = RTLIL::Const("buggy");
-					for (auto &bug : bugs) {
-						copy_to_cell(cell, bug);
-						write_design(design, output_directory, ++index);
-					}
-					copy_to_cell(cell, selections);
-					cell->attributes.erase(ID(buggy));
-					cell->getPort(ID::Y).as_wire()->attributes.erase(ID(buggy));
 				}
 			}
+
+			if (!candidates.empty()) {
+				eligible_modules.push_back(module);
+				module_candidates.push_back(candidates);
+			}
+		}
+
+		if (eligible_modules.empty()) {
+			log_warning("inject_amt: no eligible modules found; generated 0 bugs.\n");
+			return;
+		}
+
+		std::vector<int> budgets = compute_module_budgets(GetSize(eligible_modules), num_bugs);
+		int generated = 0;
+
+		for (int module_idx = 0; module_idx < GetSize(eligible_modules); ++module_idx) {
+			int module_budget = budgets[module_idx];
+			if (module_budget <= 0)
+				continue;
+
+			std::vector<AmtBugCandidate> &candidates = module_candidates[module_idx];
+			std::vector<int> order(GetSize(candidates));
+			std::iota(order.begin(), order.end(), 0);
+			std::random_shuffle(order.begin(), order.end());
+
+			int emit_count = std::min(module_budget, GetSize(candidates));
+			for (int i = 0; i < emit_count; ++i) {
+				AmtBugCandidate &candidate = candidates[order[i]];
+				RTLIL::Cell *cell = candidate.cell;
+
+				cell->attributes[ID(buggy)] = RTLIL::Const("buggy");
+				cell->getPort(ID::Y).as_wire()->attributes[ID(buggy)] = RTLIL::Const("buggy");
+				copy_to_cell(cell, candidate.selections);
+				write_design(design, output_directory, ++index);
+				++generated;
+
+				copy_to_cell(cell, original_selections[cell]);
+				cell->attributes.erase(ID(buggy));
+				cell->getPort(ID::Y).as_wire()->attributes.erase(ID(buggy));
+			}
+		}
+
+		if (generated < num_bugs) {
+			log_warning("inject_amt: requested %d bugs, generated %d. Capped to available candidates.\n",
+					num_bugs, generated);
 		}
 	}
 } InjectAmtPass;
