@@ -33,10 +33,21 @@ struct InjectPass : public Pass {
 		log("  inject [options] [selection]\n");
 		log("\n");
 		log("This pass injects architectural bugs into the design.\n");
+		log("\n");
+		log("Options:\n");
+		log("\n");
+		log("    -output-dir directory\n");
+		log("        generated designs are stored in the directory\n");
+		log("    -num-bugs number\n");
+		log("        the desired number of multiplexer bugs to be injected\n");
+		log("    -seed number\n");
+		log("        seed for deterministic random bug selection\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
 		std::string output_directory;
+		std::string num_bugs_opt;
+		std::string seed_opt;
 
 		// TODO better log
 		log_header(design, "Injecting Bugs!!!\n");
@@ -47,6 +58,14 @@ struct InjectPass : public Pass {
 				output_directory = args[++argidx];
 				continue;
 			}
+			if (args[argidx] == "-num-bugs" && argidx+1 < args.size()) {
+				num_bugs_opt = " -num-bugs " + args[++argidx];
+				continue;
+			}
+			if (args[argidx] == "-seed" && argidx+1 < args.size()) {
+				seed_opt = " -seed " + args[++argidx];
+				continue;
+			}
 		}
 		if (output_directory.empty()) {
 			log_error("Missing mandatory argument -output-dir!\n");
@@ -55,7 +74,7 @@ struct InjectPass : public Pass {
 		Pass::call(design, "inject_detect");
 		Pass::call(design, "inject_extract");
 		Pass::call(design, "write_rtlil " + output_directory + "/reference.rtlil");
-		Pass::call(design, "inject_amt -output-dir " + output_directory);
+		Pass::call(design, "inject_amt -output-dir " + output_directory + num_bugs_opt + seed_opt);
 	}
 } InjectPass;
 
